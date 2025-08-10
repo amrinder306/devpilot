@@ -1,13 +1,19 @@
 import subprocess, os
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 class GitTaskManager:
-    def __init__(self, repo_root: str):
+    def __init__(self, repo_root: str, logger: Optional[Callable[[str], None]] = None):
         self.repo_root = str(Path(repo_root).resolve())
+        self.logger = logger or (lambda _msg: None)
 
     def _run(self, args: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", self.repo_root] + args, text=True, capture_output=True, check=False)
+        cmd = ["git", "-C", self.repo_root] + args
+        self.logger("$ " + " ".join(cmd))
+        r = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        if r.stdout: self.logger(r.stdout.strip())
+        if r.stderr: self.logger(r.stderr.strip())
+        return r
 
     def current_branch(self) -> str:
         r = self._run(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -39,6 +45,13 @@ class GitTaskManager:
     def fetch(self, remote: str = "origin"):
         self._run(["fetch", remote, "--tags"])
 
+    def branches(self) -> dict:
+        """Return {'local': [...], 'remote': [...]}"""
+        loc = self._run(["branch"]).stdout.splitlines()
+        rem = self._run(["branch", "-r"]).stdout.splitlines()
+        clean = lambda xs: [x.strip().lstrip("* ").strip() for x in xs if x.strip()]
+        return {"local": clean(loc), "remote": clean(rem)}
+
     def create_branch(self, name: str) -> str:
         r = self._run(["checkout", "-B", name])
         if r.returncode != 0:
@@ -67,7 +80,10 @@ class GitTaskManager:
         lines = r.stdout.strip().splitlines() if r.returncode == 0 else []
         out = []
         for ln in lines:
-            sha, author, date, msg = ln.split("\t", 3)
+            parts = ln.split("\t")
+            if len(parts) < 4: 
+                continue
+            sha, author, date, msg = parts[0], parts[1], parts[2], "\t".join(parts[3:])
             out.append({"sha": sha, "author": author, "date": date, "message": msg})
         return out
 
@@ -85,9 +101,7 @@ class GitTaskManager:
             raise RuntimeError(r.stderr or "git revert failed")
 
     def delete_branch(self, name: str, remote: bool = False, remote_name: str = "origin"):
-        # delete local
         r1 = self._run(["branch", "-D", name])
-        # delete remote (ignore errors)
         if remote:
             self._run(["push", remote_name, "--delete", name])
         if r1.returncode != 0 and "not found" not in (r1.stderr + r1.stdout).lower():

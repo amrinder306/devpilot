@@ -1,10 +1,18 @@
 import { useEffect, useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
 import { useToasts } from "../lib/toast";
+import { useConfirm } from "../lib/confirm";
+
+// … inside component:
+
+
+// in return(), just add <Confirm /> near <View />
+
 
 type Commit = { sha: string; author: string; date: string; message: string };
 
 export default function RevertPanel() {
+    const { ask, View: Confirm } = useConfirm();
   const { push, View } = useToasts();
   const [commits, setCommits] = useState<Commit[]>([]);
   const [selected, setSelected] = useState<string>("");
@@ -33,6 +41,8 @@ export default function RevertPanel() {
 
   const revertCommitLocal = async () => {
     if (!selected) return push("Select a commit", "err");
+    const ok = await ask(`Revert commit ${selected.slice(0,12)} and push?`);
+    if (!ok) return;
     try {
       await apiPost("/git/revert-commit", { sha: selected, branch, message: commitMsg });
       await apiPost("/git/push", {});
@@ -41,9 +51,11 @@ export default function RevertPanel() {
       push("Revert failed: " + (e?.message || e), "err");
     }
   };
-
+  
   const openRevertPR = async () => {
     if (!selected) return push("Select a commit (merge sha)", "err");
+    const ok = await ask(`Open a Revert PR for ${selected.slice(0,12)}?`);
+    if (!ok) return;
     try {
       const pr = await apiPost("/git/revert-pr", {
         merge_sha: selected,
@@ -73,13 +85,15 @@ export default function RevertPanel() {
 
   const deleteBranch = async () => {
     if (!deleteBranchName.trim()) return push("Enter branch name", "err");
+    const ok = await ask(`Delete branch '${deleteBranchName}'${deleteRemote ? " (local+remote)" : ""}?`);
+    if (!ok) return;
     try {
       await apiPost("/git/delete-branch", {
         name: deleteBranchName.trim(),
         remote: deleteRemote,
         remote_name: deleteRemoteName.trim() || "origin",
       });
-      push("Branch deleted" + (deleteRemote ? " (local+remote)" : " (local)") + " ✅", "ok");
+      push("Branch deleted ✅", "ok");
     } catch (e: any) {
       push("Delete branch failed: " + (e?.message || e), "err");
     }
@@ -87,6 +101,7 @@ export default function RevertPanel() {
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr", height: "100%", gap: 12 }}>
+        <Confirm />
       <View />
 
       {/* Commits list */}
