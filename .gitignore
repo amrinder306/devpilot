@@ -1,0 +1,42 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/* !.vscode/settings.json
+
+# Node (desktop)
+desktop/node_modules/
+desktop/dist/
+desktop/out/
+desktop/.vite/
+desktop/*.log
+desktop/*.tgz
+
+# Electron artifacts
+desktop/release/
+desktop/*.dmg
+desktop/*.exe
+desktop/*.AppImage
+
+# Python (engine)
+engine/.venv/
+engine/__pycache__/
+engine/.pytest_cache/
+engine/*.pyc
+engine/.mypy_cache/
+engine/.ruff_cache/
+
+# App data / backups
+**/.devpilot_backups/
+**/*.bak
+
+# Env & local config
+.env
+.env.*
+!.env.example
+desktop/.env.local
+
+# Build cache
+**/build/
+**/dist/
