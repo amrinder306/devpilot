@@ -12,6 +12,7 @@ from utils.git_task_manager import GitTaskManager
 from dotenv import load_dotenv
 import difflib
 from datetime import datetime
+import subprocess
 # Load the .env file
 load_dotenv()
 app = FastAPI(title="DevPilot Engine", version="0.3.0")
@@ -507,24 +508,23 @@ def apply_plan(payload: Dict[str, Any] = Body(...)):
 def apply_strict(payload: Dict[str, Any] = Body(...)):
     """
     payload = {
-      "files": [{ "path": "...", "code": "...", "expected_current": "..." }],
-      "force": false
+      "files": [{ "path": "...", "code": "...", "expected_current": "...", "force": bool }],
+      "force": false  # global fallback
     }
     """
     _ensure_repo()
     repo = Path(STATE["repo_root"])
-    force = bool(payload.get("force", False))
+    global_force = bool(payload.get("force", False))
     items = payload.get("files") or []
     if not isinstance(items, list): raise HTTPException(400, "files array required")
 
-    # reuse backup logic from /apply (v0.4)
     backup_root = repo / ".devpilot_backups"
     backup_root.mkdir(exist_ok=True)
-    written = []
-    conflicts = []
+    written, conflicts = [], []
 
     for f in items:
-        rel = f.get("path"); code = f.get("code", ""); expected = f.get("expected_current", None)
+        rel = f.get("path"); code = f.get("code", ""); expected = f.get("expected_current")
+        local_force = bool(f.get("force", False)) or global_force
         if not rel: raise HTTPException(400, "each file needs path")
         relp = Path(rel)
         if relp.is_absolute() or ".." in relp.parts: raise HTTPException(400, f"invalid path: {rel}")
@@ -532,9 +532,8 @@ def apply_strict(payload: Dict[str, Any] = Body(...)):
         abs_p = repo / relp
         disk = _read_file_text(abs_p)
 
-        if expected is not None and expected != disk and not force:
-            conflicts.append(relp.as_posix())
-            continue
+        if expected is not None and expected != disk and not local_force:
+            conflicts.append(relp.as_posix()); continue
 
         abs_p.parent.mkdir(parents=True, exist_ok=True)
         if abs_p.exists():
@@ -546,4 +545,61 @@ def apply_strict(payload: Dict[str, Any] = Body(...)):
         written.append(relp.as_posix())
 
     STATE["snapshot"] = build_snapshot(repo)
-    return {"ok": True, "written": written, "conflicts": conflicts, "forced": force}
+    return {"ok": True, "written": written, "conflicts": conflicts, "forced": global_force or any(f.get("force") for f in items)}
+
+
+@app.post("/apply/plan3")
+def apply_plan3(payload: Dict[str, Any] = Body(...)):
+    """
+    payload.files: [{ path, code, expected_current? }]
+    Returns minimal 3-way context for UI (only for files that exist or conflict)
+    """
+    _ensure_repo()
+    repo = Path(STATE["repo_root"])
+    items = payload.get("files")
+    if not isinstance(items, list): raise HTTPException(400, "files array required")
+
+    out = []
+    for f in items:
+        rel = f.get("path"); proposed = f.get("code", ""); expected = f.get("expected_current")
+        if not rel: raise HTTPException(400, "each file needs path")
+        relp = Path(rel)
+        if relp.is_absolute() or ".." in relp.parts: raise HTTPException(400, f"invalid path: {rel}")
+        abs_p = repo / relp
+        current = _read_file_text(abs_p)
+        out.append({
+            "path": rel,
+            "expected": expected if expected is not None else current,  # fallback so 3 panes are always filled
+            "current": current,
+            "proposed": proposed
+        })
+    return {"ok": True, "threeway": out}
+
+@app.post("/hooks/run")
+def run_hooks(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = {
+      "commands": ["npm test --silent", "npm run lint"],  # sequential
+      "timeout": 900  # seconds
+    }
+    """
+    _ensure_repo()
+    repo = Path(STATE["repo_root"])
+    cmds = payload.get("commands") or []
+    timeout = int(payload.get("timeout", 900))
+    if not isinstance(cmds, list) or not cmds:
+        raise HTTPException(400, "commands array required")
+
+    logs = []
+    for cmd in cmds:
+        logs.append(f"$ {cmd}")
+        try:
+            p = subprocess.run(cmd, cwd=str(repo), shell=True, text=True, capture_output=True, timeout=timeout)
+            if p.stdout: logs.append(p.stdout.strip())
+            if p.stderr: logs.append(p.stderr.strip())
+            if p.returncode != 0:
+                return {"ok": False, "failed": cmd, "logs": logs}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "failed": cmd, "logs": logs + [f"Timed out after {timeout}s"]}
+    return {"ok": True, "logs": logs}
+
