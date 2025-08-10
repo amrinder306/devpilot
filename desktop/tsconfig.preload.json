@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+      "target": "ES2022",
+      "module": "CommonJS",              // <-- important (preload runs as CJS)
+      "moduleResolution": "Node",
+      "outDir": "dist/preload",
+      "rootDir": "preload",
+      "strict": true,
+      "types": ["node"]
+    },
+    "include": ["preload/**/*"],
+    "exclude": ["dist"]
+  }

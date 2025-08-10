@@ -1,0 +1,16 @@
+appId: com.devpilot.app
+productName: DevPilot App
+files:
+  - dist/**
+  - package.json
+extraResources:
+  - from: ../engine
+    to: engine
+directories:
+  output: release
+mac:
+  target: dmg
+win:
+  target: nsis
+linux:
+  target: AppImage
