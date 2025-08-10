@@ -23,12 +23,23 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "../engine", "to": "engine" }
+      {
+        "from": "../engine",
+        "to": "engine"
+      }
     ],
-    "directories": { "output": "release" },
-    "mac": { "target": "dmg" },
-    "win": { "target": "nsis" },
-    "linux": { "target": "AppImage" }
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
@@ -42,6 +53,7 @@
     "wait-on": "^7.2.0"
   },
   "dependencies": {
+    "@mlc-ai/web-llm": "^0.2.79",
     "@monaco-editor/react": "^4.7.0",
     "@vitejs/plugin-react": "^5.0.0",
     "execa": "^9.3.0",
