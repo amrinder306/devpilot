@@ -20,7 +20,10 @@ export default function GPTPatchStudio() {
   const [prTitle, setPrTitle] = useState("DevPilot: apply patch");
   const [prBody, setPrBody]   = useState("Automated patch via DevPilot App.");
   const [useTargetedTests, setUseTargetedTests] = useState(true);
-
+  const [autoPrompt, setAutoPrompt] = useState("");
+  const [autoDry, setAutoDry] = useState(true);
+  const [autoForce, setAutoForce] = useState(false);
+  
   const selected = useMemo(() => files.filter(f => f.apply), [files]);
   const selectedPaths = useMemo(() => selected.map(f => f.path), [selected]);
   // add two helpers:
@@ -129,7 +132,39 @@ const doGitFlow = async () => {
       push("Pushed. PR not created (toggle in UI).", "ok");
     }
   };
-
+  const runAutoPatch = async () => {
+    if (!autoPrompt.trim()) return push("Write a prompt first", "err");
+    try {
+      // Build strict instruction wrapper so the model returns files[]
+      const wrapper = [
+        "You are an AI code assistant. Return STRICT JSON with code changes.",
+        "",
+        "Response schema:",
+        "{ \"files\": [ { \"path\": \"relative/path\", \"code\": \"FULL FILE CONTENT\" } ] }",
+        "Do not include explanations, only JSON.",
+        "",
+        "Task:",
+        autoPrompt.trim()
+      ].join("\n");
+  
+      const res = await apiPost("/autopatch", { prompt: wrapper, dry_run: autoDry, force: autoForce });
+      if (!res?.files) return push("Model returned no files", "err");
+  
+      // Load into Patch Studio buffers
+      const filled: GptFile[] = [];
+      for (const f of res.files) {
+        let current = "";
+        try { const meta = await apiGet<{ code: string }>("/repo/metadata?path=" + encodeURIComponent(f.path)); current = meta.code || ""; } catch {}
+        filled.push({ path: f.path, code: f.code, current, apply: true, force: autoForce });
+      }
+      setFiles(filled);
+      setPlan(res.plan || null);
+      push(res.applied ? "Auto-Patch applied ✅" : "Auto-Patch planned (dry run)", "ok");
+    } catch (e:any) {
+      push("Auto-Patch failed: " + (e?.message || e), "err");
+    }
+  };
+  
   const toggleApply = (p: string) => setFiles(prev => prev.map(f => f.path === p ? { ...f, apply: !f.apply } : f));
   const toggleForce = (p: string) => setFiles(prev => prev.map(f => f.path === p ? { ...f, force: !f.force } : f));
 
@@ -164,6 +199,25 @@ const doGitFlow = async () => {
                 Import Session
             </label>
             </div>
+            <div style={{ marginTop: 10, fontWeight: 600 }}>Auto-Patch</div>
+            <textarea
+            placeholder="Describe the change. The app will ask your configured model to return JSON { files: [...] }."
+            value={autoPrompt}
+            onChange={(e)=>setAutoPrompt(e.target.value)}
+            style={{ height: 90, fontFamily: "monospace" }}
+            />
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6, flexWrap: "wrap" }}>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <input type="checkbox" checked={autoDry} onChange={(e)=>setAutoDry(e.target.checked)} />
+                Dry run
+            </label>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <input type="checkbox" checked={autoForce} onChange={(e)=>setAutoForce(e.target.checked)} />
+                Force on conflict
+            </label>
+            <button onClick={runAutoPatch}>Run Auto-Patch</button>
+            </div>
+
         </div>
         <div style={{ display: "flex", flexDirection: "column" }}>
           <div style={{ fontWeight: 600, marginBottom: 6 }}>Git</div>

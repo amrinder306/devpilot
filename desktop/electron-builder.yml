@@ -8,9 +8,24 @@ extraResources:
     to: engine
 directories:
   output: release
+
 mac:
   target: dmg
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize:
+    teamId: "TEAMIDHERE"          # <-- replace
+    appleId: "appleid@example.com" # <-- replace
+    appleIdPassword: "@keychain:AC_PASSWORD"  # or env var
+dmg:
+  sign: false  # dmg itself doesn't need signing; the app bundle is signed
+
 win:
   target: nsis
+  signingHashAlgorithms: ["sha256"]
+  certificateFile: "build/certs/windows.pfx"   # <-- place your cert
+  certificatePassword: "${WIN_CSC_LINK_PWD}"   # or env var
+
 linux:
   target: AppImage

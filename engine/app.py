@@ -14,6 +14,10 @@ import difflib
 from datetime import datetime
 import subprocess
 from openai import OpenAI
+import requests
+import fnmatch
+from utils.settings_manager import load_settings, save_settings
+
 # Load the .env file
 load_dotenv()
 app = FastAPI(title="DevPilot Engine", version="0.3.0")
@@ -30,15 +34,132 @@ def log(msg: str):
     LOGS.append(msg)
     if len(LOGS) > 500:
         del LOGS[:len(LOGS)-500]
-
+DEFAULT_IGNORES = [
+    ".git/**","node_modules/**","dist/**","build/**",".venv/**",".devpilot_backups/**","*.lock","*.min.*"
+]
+DEFAULT_SETTINGS = {
+    "slug_override": None,
+    "default_base": None,
+    "ai": {
+        "mode": "dev",
+        "provider": "openai",
+        "openai_key": None,
+        "http_endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+        "model": "gpt-4o-mini"
+    },
+    "telemetry": {"enabled": False, "runs": 0, "applied_files": 0},
+    "first_run_done": False,
+    "ignore_patterns": DEFAULT_IGNORES.copy(),
+}
 STATE: Dict[str, Any] = {
     "repo_root": None,
     "snapshot": {},
-    "settings": {  # new
-        "slug_override": None,      # "owner/repo"
-        "default_base": None        # e.g. "main"
-    }
+    "settings": load_settings(DEFAULT_SETTINGS)  # ← persisted
 }
+def _repo_ignore_file(repo_root: Path) -> Path:
+    return repo_root / ".devpilotignore"
+
+def _parse_ignore_text(text: str) -> list[str]:
+    lines = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"): 
+            continue
+        lines.append(s)
+    return lines
+
+def _load_repo_ignores(repo_root: Path) -> list[str]:
+    f = _repo_ignore_file(repo_root)
+    if not f.exists(): 
+        return []
+    try:
+        return _parse_ignore_text(f.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return []
+
+def _effective_ignores(repo_root: Path | None) -> list[str]:
+    # merge: repo file (highest precedence) > user settings > defaults (already in settings)
+    pats = (STATE["settings"].get("ignore_patterns") or []).copy()
+    if repo_root:
+        repo_ign = _load_repo_ignores(Path(repo_root))
+        if repo_ign:
+            # ensure repo patterns win by placing them last (checked first below)
+            pats = (pats or []) + ["# REPO-LOCAL BELOW"] + repo_ign
+    return [p for p in pats if p and not p.startswith("#")]
+
+def _is_ignored(rel_posix: str) -> bool:
+    pats = _effective_ignores(STATE["repo_root"])
+    for pat in pats:
+        if fnmatch.fnmatch(rel_posix, pat):
+            return True
+        if pat.endswith("/**") and (rel_posix == pat[:-3] or rel_posix.startswith(pat[:-3] + "/")):
+            return True
+    return False
+
+def build_snapshot(repo_root: Path) -> Dict[str, Any]:
+    snap: Dict[str, Any] = {}
+    for root, _, files in os.walk(repo_root):
+        for f in files:
+            p = Path(root) / f
+            rel = p.relative_to(repo_root).as_posix()
+            if _is_ignored(rel):
+                continue
+            try:
+                size = p.stat().st_size
+            except Exception:
+                size = 0
+            snap[rel] = {"size": size, "ext": p.suffix.lower()}
+    return snap
+
+def _mux_complete(prompt: str, files_hint: list[dict] | None = None) -> dict:
+    """
+    Returns {"files":[{"path":"...","code":"..."}], "raw": <raw response>}
+    Uses provider from STATE["settings"]["ai"].
+    The prompt must instruct STRICT JSON {"files":[...]}.
+    """
+    ai = STATE["settings"]["ai"]
+    provider = ai.get("provider")
+    model = ai.get("model") or "gpt-4o-mini"
+
+    if provider == "openai":
+        from openai import OpenAI
+        key = ai.get("openai_key")
+        if not key:
+            raise HTTPException(400, "OpenAI key not set")
+        client = OpenAI(api_key=key)
+        out = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2,
+            max_tokens=4096
+        )
+        text = out.choices[0].message.content or ""
+        raw = out.model_dump()
+    elif provider == "http":
+        ep = ai.get("http_endpoint")
+        if not ep:
+            raise HTTPException(400, "HTTP endpoint not configured")
+        payload = {"model": model, "messages":[{"role":"user","content":prompt}], "temperature":0.2, "max_tokens":4096}
+        r = requests.post(ep, json=payload, timeout=120)
+        if r.status_code >= 300:
+            raise HTTPException(r.status_code, f"HTTP provider failed: {r.text[:400]}")
+        data = r.json()
+        text = data.get("choices",[{}])[0].get("message",{}).get("content","")
+        raw = data
+    else:
+        # webllm (dev): the renderer handles this client-side; engine just returns unsupported
+        raise HTTPException(400, "Provider 'webllm' runs in renderer; use UI Auto-Patch (Dev Mode)")
+
+    # extract JSON block
+    try:
+        # naive extraction: find first '{' and last '}' for a JSON object
+        import json, re
+        match = re.search(r"\{[\s\S]*\}", text)
+        obj = json.loads(match.group(0)) if match else json.loads(text)
+        if not isinstance(obj.get("files"), list): raise ValueError("no files[]")
+        return {"files": obj["files"], "raw": raw}
+    except Exception as e:
+        raise HTTPException(500, f"Model did not return valid JSON files[]: {e}")
 def _read_file_text(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
 
@@ -401,21 +522,23 @@ def git_revert_pr(payload: Dict[str, Any] = Body(...)):
 
     return {"ok": True, "pr": resp.json()}
 
-@app.get("/settings")
-def get_settings():
-    return {"ok": True, "settings": STATE["settings"]}
-
 @app.post("/settings")
 def set_settings(payload: Dict[str, Any] = Body(...)):
     s = STATE["settings"]
     if "slug_override" in payload: s["slug_override"] = payload.get("slug_override")
     if "default_base"  in payload: s["default_base"]  = payload.get("default_base")
+    if "first_run_done" in payload: s["first_run_done"] = bool(payload.get("first_run_done"))
+    if "telemetry" in payload and isinstance(payload["telemetry"], dict):
+        tel = s["telemetry"]
+        tel["enabled"] = bool(payload["telemetry"].get("enabled", tel["enabled"]))
     if "ai" in payload and isinstance(payload["ai"], dict):
         s_ai = s["ai"]
-        for k in ["mode", "provider", "openai_key"]:
+        for k in ["mode", "provider", "openai_key", "http_endpoint", "model"]:
             if k in payload["ai"]:
                 s_ai[k] = payload["ai"][k]
-    return {"ok": True, "settings": s}
+    save_settings(STATE["settings"])
+    return {"ok": True, "settings": STATE["settings"]}
+   
 
 
 @app.get("/logs")
@@ -706,3 +829,93 @@ def session_import(payload: Dict[str, Any] = Body(...)):
     if "snapshot" in sess and isinstance(sess["snapshot"], dict):
         STATE["snapshot"] = sess["snapshot"]
     return {"ok": True, "settings": STATE["settings"], "snapshot_len": len(STATE["snapshot"])}
+
+@app.post("/autopatch")
+def autopatch(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = {
+      "prompt": "...",                 # full prompt built by UI
+      "dry_run": True,                 # preview only
+      "force": False                   # override conflicts
+    }
+    """
+    _ensure_repo()
+    s = STATE["settings"]
+    tel = s["telemetry"]
+    dry = bool(payload.get("dry_run", True))
+    force = bool(payload.get("force", False))
+    prompt = payload.get("prompt")
+    if not prompt: raise HTTPException(400, "prompt required")
+
+    # call model
+    result = _mux_complete(prompt)
+    files = result["files"]
+
+    # plan
+    plan_res = apply_plan({"files":[{"path":f["path"],"code":f["code"],"expected_current":_read_file_text(Path(STATE["repo_root"])/f["path"])} for f in files]})  # type: ignore
+    plan = plan_res["plan"]
+
+    if dry:
+        if tel["enabled"]: tel["runs"] += 1
+        return {"ok": True, "plan": plan, "files": files, "applied": False}
+
+    # apply strict
+    strict_res = apply_strict({"files":[{"path":f["path"],"code":f["code"],"expected_current":_read_file_text(Path(STATE["repo_root"])/f["path"]), "force": force} for f in files], "force": force})
+    if tel["enabled"]:
+        tel["runs"] += 1
+        tel["applied_files"] += len(strict_res.get("written", []))
+    return {"ok": True, "plan": plan, "files": files, "applied": True, "strict": strict_res}
+
+@app.get("/ignore")
+def get_ignore():
+    return {"ok": True, "patterns": STATE["settings"].get("ignore_patterns", [])}
+
+@app.post("/ignore")
+def set_ignore(payload: Dict[str, Any] = Body(...)):
+    pats = payload.get("patterns")
+    if not isinstance(pats, list):
+        raise HTTPException(400, "patterns must be an array of glob expressions")
+    STATE["settings"]["ignore_patterns"] = pats
+    # refresh snapshot if repo loaded
+    save_settings(STATE["settings"])
+    if STATE["repo_root"]:
+        STATE["snapshot"] = build_snapshot(Path(STATE["repo_root"]))
+    return {"ok": True, "patterns": pats}
+
+@app.post("/repo/rescan")
+def repo_rescan():
+    _ensure_repo()
+    root = Path(STATE["repo_root"])
+    STATE["snapshot"] = build_snapshot(root)
+    return {"ok": True, "files": len(STATE["snapshot"])}
+@app.get("/ignore/repo")
+def get_ignore_repo():
+    if not STATE["repo_root"]:
+        return {"ok": True, "patterns": []}
+    pats = _load_repo_ignores(Path(STATE["repo_root"]))
+    return {"ok": True, "patterns": pats}
+
+@app.post("/ignore/repo")
+def set_ignore_repo(payload: Dict[str, Any] = Body(...)):
+    if not STATE["repo_root"]:
+        raise HTTPException(400, "No repo scanned yet")
+    pats = payload.get("patterns")
+    if not isinstance(pats, list):
+        raise HTTPException(400, "patterns must be an array of glob expressions")
+    txt = "\n".join(pats) + "\n"
+    f = _repo_ignore_file(Path(STATE["repo_root"]))
+    f.write_text(txt, encoding="utf-8")
+    # refresh snapshot using effective ignores
+    STATE["snapshot"] = build_snapshot(Path(STATE["repo_root"]))
+    return {"ok": True, "patterns": pats}
+@app.post("/repo/rescan")
+def repo_rescan():
+    _ensure_repo()
+    STATE["snapshot"] = build_snapshot(Path(STATE["repo_root"]))
+    return {"ok": True, "files": len(STATE["snapshot"])}
+def _openai_client() -> "OpenAI":
+    from openai import OpenAI
+    key = os.environ.get("OPENAI_API_KEY") or STATE["settings"]["ai"].get("openai_key")
+    if not key:
+        raise HTTPException(400, "OpenAI key not set (env OPENAI_API_KEY or settings.ai.openai_key)")
+    return OpenAI(api_key=key)

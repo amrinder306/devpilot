@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import RepoPicker from "./components/RepoPicker";
 import FileTree from "./components/FileTree";
 import PromptCreator from "./components/PromptCreator";
@@ -10,18 +10,32 @@ import LogsPanel from "./components/LogsPanel";
 import StatusBar from "./components/StatusBar";
 import AuthPanel from "./components/AuthPanel";
 import WebLLMPanel from "./components/WebLLMPanel";
+import FirstRun from "./components/FirstRun";
+import { apiGet, apiPost } from "./lib/api";
+import IgnoreEditor from "./components/IgnoreEditor";
 
 export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
   const [tab, setTab] = useState<"build"|"revert"|"repo"|"logs">("build");
-
+  const [firstRun, setFirstRun] = useState(false);
+  useEffect(() => { (async () => {
+    const s = await apiGet<{ settings:any }>("/settings");
+    setFirstRun(!s.settings?.first_run_done);
+  })(); }, []);
+  const rescan = async () => {
+    await apiPost("/repo/rescan", {});
+    setRefresh(x => x + 1);
+  };
+  
   return (
     <div style={{ display: "grid", gridTemplateRows: "48px 40px 1fr 26px", height: "100vh" }}>
+      {firstRun && <FirstRun onDone={() => setFirstRun(false)} />}
       {/* Top bar */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "0 12px", borderBottom: "1px solid #eee" }}>
         <h3 style={{ margin: 0, fontWeight: 700 }}>DevPilot App</h3>
         <RepoPicker onScanned={() => setRefresh((x) => x + 1)} />
+        <button onClick={rescan}>Rescan</button>
         {selected && <div style={{ marginLeft: "auto", opacity: 0.7, fontSize: 12 }}>Selected: {selected}</div>}
       </div>
 
@@ -63,6 +77,7 @@ export default function App() {
             <RepoSettings />
             <AuthPanel />
             <WebLLMPanel />
+            <IgnoreEditor />
           </div>
           <BranchesPRs />
         </div>
