@@ -8,6 +8,7 @@ import BranchesPRs from "./components/BranchesPRs";
 import RepoSettings from "./components/RepoSettings";
 import LogsPanel from "./components/LogsPanel";
 import StatusBar from "./components/StatusBar";
+import AuthPanel from "./components/AuthPanel";
 
 export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
@@ -57,7 +58,10 @@ export default function App() {
       )}
       {tab === "repo" && (
         <div style={{ padding: 8, height: "100%", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-          <RepoSettings />
+          <div style={{ display: "grid", gridTemplateRows: "auto auto 1fr", gap: 16 }}>
+            <RepoSettings />
+            <AuthPanel />
+          </div>
           <BranchesPRs />
         </div>
       )}

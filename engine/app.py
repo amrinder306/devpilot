@@ -10,7 +10,8 @@ import os, shutil
 
 from utils.git_task_manager import GitTaskManager
 from dotenv import load_dotenv
-
+import difflib
+from datetime import datetime
 # Load the .env file
 load_dotenv()
 app = FastAPI(title="DevPilot Engine", version="0.3.0")
@@ -36,7 +37,12 @@ STATE: Dict[str, Any] = {
         "default_base": None        # e.g. "main"
     }
 }
+def _read_file_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
 
+def _file_mtime(p: Path) -> float:
+    try: return p.stat().st_mtime
+    except: return 0.0
 @app.get("/health")
 def health():
     return {"ok": True, "engine": "devpilot", "version": "0.3.0"}
@@ -400,9 +406,15 @@ def get_settings():
 @app.post("/settings")
 def set_settings(payload: Dict[str, Any] = Body(...)):
     s = STATE["settings"]
-    s["slug_override"] = payload.get("slug_override")
-    s["default_base"]  = payload.get("default_base")
+    if "slug_override" in payload: s["slug_override"] = payload.get("slug_override")
+    if "default_base"  in payload: s["default_base"]  = payload.get("default_base")
+    if "ai" in payload and isinstance(payload["ai"], dict):
+        s_ai = s["ai"]
+        for k in ["mode", "provider", "openai_key"]:
+            if k in payload["ai"]:
+                s_ai[k] = payload["ai"][k]
     return {"ok": True, "settings": s}
+
 
 @app.get("/logs")
 def get_logs():
@@ -442,3 +454,96 @@ def git_remote(remote: str = "origin"):
     slug = STATE["settings"].get("slug_override") or g.repo_slug_from_remote(remote)
     host = "github.com" if "github.com" in (url or "") else None
     return {"ok": True, "remote": remote, "url": url, "slug": slug, "host": host}
+@app.post("/apply/plan")
+def apply_plan(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = {
+      "files": [
+        { "path": "...", "code": "...", "expected_current": "..." }  # expected_current optional
+      ]
+    }
+    Returns a plan with create/update/unchanged/conflict and diffs.
+    """
+    _ensure_repo()
+    repo = Path(STATE["repo_root"])
+    items = payload.get("files")
+    if not isinstance(items, list): raise HTTPException(400, "files array required")
+
+    plan = {"create": [], "update": [], "unchanged": [], "conflict": [], "summary": {}}
+    for f in items:
+        rel = f.get("path"); new_code = f.get("code", "")
+        if not rel: raise HTTPException(400, "each file needs path")
+        relp = Path(rel)
+        if relp.is_absolute() or ".." in relp.parts: raise HTTPException(400, f"invalid path: {rel}")
+
+        abs_p = repo / relp
+        exists = abs_p.exists()
+        current = _read_file_text(abs_p)
+        expected = f.get("expected_current", None)
+
+        if not exists:
+            plan["create"].append({"path": rel, "diff": list(difflib.unified_diff([], new_code.splitlines(), lineterm=""))})
+            continue
+
+        if current == new_code:
+            plan["unchanged"].append({"path": rel})
+            continue
+
+        # conflict detection: if expected_current provided and doesn't match disk, we flag conflict
+        if expected is not None and expected != current:
+            diff_a = list(difflib.unified_diff(expected.splitlines(), current.splitlines(), fromfile="expected", tofile="current", lineterm=""))
+            diff_b = list(difflib.unified_diff(current.splitlines(), new_code.splitlines(), fromfile="current", tofile="proposed", lineterm=""))
+            plan["conflict"].append({"path": rel, "diff_expected_vs_current": diff_a, "diff_current_vs_proposed": diff_b})
+        else:
+            # normal update
+            diff = list(difflib.unified_diff(current.splitlines(), new_code.splitlines(), fromfile="current", tofile="proposed", lineterm=""))
+            plan["update"].append({"path": rel, "diff": diff})
+
+    plan["summary"] = {k: len(plan[k]) for k in ["create","update","unchanged","conflict"]}
+    return {"ok": True, "plan": plan}
+
+# strengthen /apply to optionally enforce expected_current unless force=true
+@app.post("/apply/strict")
+def apply_strict(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = {
+      "files": [{ "path": "...", "code": "...", "expected_current": "..." }],
+      "force": false
+    }
+    """
+    _ensure_repo()
+    repo = Path(STATE["repo_root"])
+    force = bool(payload.get("force", False))
+    items = payload.get("files") or []
+    if not isinstance(items, list): raise HTTPException(400, "files array required")
+
+    # reuse backup logic from /apply (v0.4)
+    backup_root = repo / ".devpilot_backups"
+    backup_root.mkdir(exist_ok=True)
+    written = []
+    conflicts = []
+
+    for f in items:
+        rel = f.get("path"); code = f.get("code", ""); expected = f.get("expected_current", None)
+        if not rel: raise HTTPException(400, "each file needs path")
+        relp = Path(rel)
+        if relp.is_absolute() or ".." in relp.parts: raise HTTPException(400, f"invalid path: {rel}")
+
+        abs_p = repo / relp
+        disk = _read_file_text(abs_p)
+
+        if expected is not None and expected != disk and not force:
+            conflicts.append(relp.as_posix())
+            continue
+
+        abs_p.parent.mkdir(parents=True, exist_ok=True)
+        if abs_p.exists():
+            backup = backup_root / (relp.as_posix() + ".bak")
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if not backup.exists():
+                shutil.copyfile(abs_p, backup)
+        abs_p.write_text(code, encoding="utf-8")
+        written.append(relp.as_posix())
+
+    STATE["snapshot"] = build_snapshot(repo)
+    return {"ok": True, "written": written, "conflicts": conflicts, "forced": force}
