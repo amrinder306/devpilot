@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import difflib
 from datetime import datetime
 import subprocess
+from openai import OpenAI
 # Load the .env file
 load_dotenv()
 app = FastAPI(title="DevPilot Engine", version="0.3.0")
@@ -603,3 +604,105 @@ def run_hooks(payload: Dict[str, Any] = Body(...)):
             return {"ok": False, "failed": cmd, "logs": logs + [f"Timed out after {timeout}s"]}
     return {"ok": True, "logs": logs}
 
+def _guess_test_commands(paths: list[str]) -> list[str]:
+    # Heuristics for common stacks — customize for your repo later
+    cmds = []
+    any_js = any(p.endswith((".js",".jsx",".ts",".tsx")) for p in paths)
+    any_py = any(p.endswith(".py") for p in paths)
+    any_cs = any(p.endswith((".cs",".fs",".vb")) for p in paths)
+
+    if any_js:
+        # map src/foo/bar.ts -> tests matching foo|bar
+        pats = list({Path(p).stem for p in paths})
+        grep = "|".join(pats) or "."
+        cmds += [
+            "test -f package.json && (npm run -s test -- " + f"-- {grep}" + " || echo 'js tests done')"
+        ]
+    if any_py:
+        # pytest -k "foo or bar"
+        pats = list({Path(p).stem for p in paths})
+        expr = " or ".join(pats) or ""
+        cmds += [
+            "test -f pyproject.toml || test -f pytest.ini && (pytest -q " + (f"-k \"{expr}\"" if expr else "") + " || echo 'py tests done')"
+        ]
+    if any_cs:
+        cmds += [
+            "ls *.sln 1>/dev/null 2>&1 && dotnet test || echo 'dotnet tests done'"
+        ]
+    return [c for c in cmds if c]
+
+@app.post("/hooks/targets")
+def run_targeted_hooks(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = { "paths": ["a/b.ts", ...], "timeout": 900 }
+    Returns the commands selected + their logs.
+    """
+    _ensure_repo()
+    repo = Path(STATE["repo_root"])
+    paths = payload.get("paths") or []
+    timeout = int(payload.get("timeout", 900))
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(400, "paths array required")
+
+    commands = _guess_test_commands(paths)
+    logs = []
+    for cmd in commands:
+        logs.append(f"$ {cmd}")
+        p = subprocess.run(cmd, cwd=str(repo), shell=True, text=True, capture_output=True, timeout=timeout)
+        if p.stdout: logs.append(p.stdout.strip())
+        if p.stderr: logs.append(p.stderr.strip())
+        if p.returncode != 0:
+            return {"ok": False, "failed": cmd, "logs": logs, "commands": commands}
+    return {"ok": True, "logs": logs, "commands": commands}
+
+
+def _openai_client() -> OpenAI:
+    key = STATE["settings"]["ai"].get("openai_key")
+    if not key:
+        raise HTTPException(400, "OpenAI key not set in settings.ai.openai_key")
+    return OpenAI(api_key=key)
+
+@app.post("/ai/complete")
+def ai_complete(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = { "messages": [{role, content}, ...], "model": "gpt-4o-mini", "max_tokens": 1024, "temperature": 0.2 }
+    """
+    s = STATE["settings"]["ai"]
+    if s.get("mode") != "pro" or s.get("provider") != "openai":
+        raise HTTPException(400, "AI not in Pro/OpenAI mode")
+    client = _openai_client()
+    model = payload.get("model") or "gpt-4o-mini"
+    messages = payload.get("messages") or []
+    max_tokens = int(payload.get("max_tokens", 1024))
+    temperature = float(payload.get("temperature", 0.2))
+    try:
+        out = client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+        return {"ok": True, "output": out.model_dump()}
+    except Exception as e:
+        raise HTTPException(500, f"OpenAI call failed: {e}")
+    
+@app.post("/session/export")
+def session_export(payload: Dict[str, Any] = Body(default={})):
+    """
+    Optionally pass { include_snapshot: true }
+    """
+    include_snapshot = bool(payload.get("include_snapshot", False))
+    data = {
+        "version": "0.9.0",
+        "settings": STATE["settings"],
+        "repo_root": STATE["repo_root"],
+        "snapshot": STATE["snapshot"] if include_snapshot else {},
+    }
+    return {"ok": True, "session": data}
+
+@app.post("/session/import")
+def session_import(payload: Dict[str, Any] = Body(...)):
+    sess = payload.get("session")
+    if not isinstance(sess, dict):
+        raise HTTPException(400, "session object required")
+    # do not overwrite repo_root silently — only accept settings/snapshot
+    if "settings" in sess and isinstance(sess["settings"], dict):
+        STATE["settings"] = sess["settings"]
+    if "snapshot" in sess and isinstance(sess["snapshot"], dict):
+        STATE["snapshot"] = sess["snapshot"]
+    return {"ok": True, "settings": STATE["settings"], "snapshot_len": len(STATE["snapshot"])}
