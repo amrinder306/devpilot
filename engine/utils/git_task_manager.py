@@ -1,4 +1,4 @@
-import subprocess, os, json
+import subprocess, os
 from pathlib import Path
 from typing import Optional, List
 
@@ -14,11 +14,9 @@ class GitTaskManager:
         return r.stdout.strip()
 
     def default_branch(self) -> str:
-        # tries origin/HEAD -> refs
         r = self._run(["symbolic-ref", "refs/remotes/origin/HEAD"])
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip().split("/")[-1]
-        # fallback: main or master
         for b in ["main", "master"]:
             r = self._run(["rev-parse", "--verify", b])
             if r.returncode == 0:
@@ -30,15 +28,16 @@ class GitTaskManager:
         return r.stdout.strip() if r.returncode == 0 else None
 
     def repo_slug_from_remote(self, remote: str = "origin") -> Optional[str]:
-        # support: https://github.com/owner/repo.git or git@github.com:owner/repo.git
-        url = self.remote_url(remote) or ""
-        url = url.replace(".git", "")
+        url = (self.remote_url(remote) or "").replace(".git", "")
         if "github.com" in url:
             if url.startswith("git@github.com:"):
                 return url.split("git@github.com:")[1]
             if "github.com/" in url:
                 return url.split("github.com/")[1]
         return None
+
+    def fetch(self, remote: str = "origin"):
+        self._run(["fetch", remote, "--tags"])
 
     def create_branch(self, name: str) -> str:
         r = self._run(["checkout", "-B", name])
@@ -61,3 +60,35 @@ class GitTaskManager:
         r = self._run(["push", remote, br])
         if r.returncode != 0:
             raise RuntimeError(r.stderr or "git push failed")
+
+    def log(self, limit: int = 30) -> List[dict]:
+        fmt = "%H%x09%an%x09%ad%x09%s"
+        r = self._run(["log", f"--pretty=format:{fmt}", f"-{limit}"])
+        lines = r.stdout.strip().splitlines() if r.returncode == 0 else []
+        out = []
+        for ln in lines:
+            sha, author, date, msg = ln.split("\t", 3)
+            out.append({"sha": sha, "author": author, "date": date, "message": msg})
+        return out
+
+    def checkout(self, ref: str):
+        r = self._run(["checkout", ref])
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr or f"git checkout {ref} failed")
+
+    def revert_commit(self, sha: str, no_edit: bool = True):
+        args = ["revert", sha]
+        if no_edit:
+            args.insert(1, "--no-edit")
+        r = self._run(args)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr or "git revert failed")
+
+    def delete_branch(self, name: str, remote: bool = False, remote_name: str = "origin"):
+        # delete local
+        r1 = self._run(["branch", "-D", name])
+        # delete remote (ignore errors)
+        if remote:
+            self._run(["push", remote_name, "--delete", name])
+        if r1.returncode != 0 and "not found" not in (r1.stderr + r1.stdout).lower():
+            raise RuntimeError(r1.stderr or "git branch -D failed")
