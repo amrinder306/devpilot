@@ -252,3 +252,132 @@ def git_create_pr(payload: Dict[str, str] = Body(...)):
         raise HTTPException(resp.status_code, f"GitHub PR create failed: {resp.text}")
 
     return {"ok": True, "pr": resp.json()}
+
+# v0.5: list recent commits
+@app.get("/git/log")
+def git_log(limit: int = 30):
+    _ensure_repo()
+    g = GitTaskManager(STATE["repo_root"])
+    return {"ok": True, "commits": g.log(limit)}
+
+# v0.5: revert a commit locally (usually the PR merge commit)
+@app.post("/git/revert-commit")
+def git_revert_commit(payload: Dict[str, str] = Body(...)):
+    _ensure_repo()
+    sha = payload.get("sha")
+    branch = payload.get("branch")  # optional: create/use a revert branch
+    remote = payload.get("remote", "origin")
+    message = payload.get("message", "revert: automated")
+    if not sha:
+        raise HTTPException(400, "sha required")
+
+    g = GitTaskManager(STATE["repo_root"])
+    g.fetch(remote)
+
+    if branch:
+        g.create_branch(branch)
+
+    g.revert_commit(sha, no_edit=True)
+    g.commit(message)  # ensure a commit exists (revert produces one)
+    return {"ok": True, "branch": g.current_branch()}
+
+# v0.5: delete a branch (local + optional remote)
+@app.post("/git/delete-branch")
+def git_delete_branch(payload: Dict[str, Any] = Body(...)):
+    _ensure_repo()
+    name = payload.get("name")
+    remote = bool(payload.get("remote", False))
+    remote_name = payload.get("remote_name", "origin")
+    if not name:
+        raise HTTPException(400, "name required")
+    g = GitTaskManager(STATE["repo_root"])
+    g.delete_branch(name, remote=remote, remote_name=remote_name)
+    return {"ok": True}
+
+# v0.5: close an open PR on GitHub
+@app.post("/git/close-pr")
+def git_close_pr(payload: Dict[str, Any] = Body(...)):
+    _ensure_repo()
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise HTTPException(400, "GITHUB_TOKEN not set")
+
+    number = payload.get("number")
+    remote = payload.get("remote", "origin")
+    slug = payload.get("slug")
+
+    if not number:
+        raise HTTPException(400, "PR number required")
+
+    g = GitTaskManager(STATE["repo_root"])
+    if not slug:
+        slug = g.repo_slug_from_remote(remote)
+    if not slug:
+        raise HTTPException(400, "Could not infer repo slug; pass payload.slug")
+
+    url = f"https://api.github.com/repos/{slug}/pulls/{number}"
+    resp = requests.patch(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }, json={"state": "closed"})
+    if resp.status_code >= 300:
+        raise HTTPException(resp.status_code, f"Close PR failed: {resp.text}")
+    return {"ok": True, "pr": resp.json()}
+
+# v0.5: create a revert PR from a merge commit
+@app.post("/git/revert-pr")
+def git_revert_pr(payload: Dict[str, Any] = Body(...)):
+    """
+    payload: {
+      "merge_sha": "...",                # merge commit SHA of the original PR
+      "base": "main",                    # base to target
+      "remote": "origin",
+      "branch": "revert/<shortsha>",     # new branch name
+      "title": "Revert: ...",
+      "body": "..."
+    }
+    """
+    _ensure_repo()
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise HTTPException(400, "GITHUB_TOKEN not set")
+
+    merge_sha = payload.get("merge_sha")
+    base = payload.get("base")
+    remote = payload.get("remote", "origin")
+    branch = payload.get("branch")
+    title = payload.get("title") or "Revert PR"
+    body = payload.get("body") or ""
+
+    if not merge_sha:
+        raise HTTPException(400, "merge_sha required")
+
+    g = GitTaskManager(STATE["repo_root"])
+    g.fetch(remote)
+    if not base:
+        base = g.default_branch()
+    if not branch:
+        branch = f"revert/{merge_sha[:7]}"
+
+    # create branch off base and revert
+    g.checkout(base)
+    g.create_branch(branch)
+    g.revert_commit(merge_sha, no_edit=True)
+    g.commit(f"revert: {merge_sha}")
+
+    # push and open PR
+    g.push(remote, branch)
+    slug = g.repo_slug_from_remote(remote)
+    if not slug:
+        raise HTTPException(400, "Could not infer repo slug from remote")
+
+    url = f"https://api.github.com/repos/{slug}/pulls"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        json={"title": title, "body": body, "head": branch, "base": base}
+    )
+    if resp.status_code >= 300:
+        raise HTTPException(resp.status_code, f"GitHub PR create failed: {resp.text}")
+
+    return {"ok": True, "pr": resp.json()}
