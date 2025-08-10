@@ -9,8 +9,26 @@
     "dev:renderer": "vite",
     "dev:main": "concurrently -k \"tsc -w -p tsconfig.main.json\" \"tsc -w -p tsconfig.preload.json\"",
     "dev:electron": "wait-on dist/main/main.js dist/preload/index.js && electron .",
+    "clean": "rm -rf dist release",
+    "pack": "npm run clean && tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json && vite build && electron-builder",
     "build": "tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json && vite build && electron-builder",
     "postinstall": "electron-builder install-app-deps"
+  },
+  "build": {
+    "appId": "com.devpilot.app",
+    "productName": "DevPilot App",
+    "files": [
+      "dist/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "../engine", "to": "engine" }
+    ],
+    "directories": { "output": "release" },
+    "mac": { "target": "dmg" },
+    "win": { "target": "nsis" },
+    "linux": { "target": "AppImage" }
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
@@ -24,6 +42,7 @@
     "wait-on": "^7.2.0"
   },
   "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
     "@vitejs/plugin-react": "^5.0.0",
     "execa": "^9.3.0",
     "get-port": "^7.1.0",

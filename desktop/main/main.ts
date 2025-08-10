@@ -105,7 +105,7 @@ async function startEngine() {
 
 async function createWindow() {
   try { await startEngine(); } catch (e) { console.warn("startEngine error:", e); }
-
+  const isDev = !app.isPackaged;
   win = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -113,15 +113,15 @@ async function createWindow() {
       preload: path.resolve(__dirname, "../preload/index.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
-      additionalArguments: [`--devpilot-base-url=${baseUrl}`]
+      webSecurity: isDev,                 // true in dev, false in prod
+      allowRunningInsecureContent: !isDev 
     }
   });
 
-  if (!app.isPackaged) {
+  if (isDev) {
     await win.loadURL("http://localhost:5173");
   } else {
-    await win.loadFile(path.resolve(__dirname, "../renderer/index.html"));
+    await win.loadFile(path.resolve(__dirname, "../../renderer/index.html"));
   }
 }
 
@@ -157,3 +157,6 @@ app.on("activate", () => {
 
 // Optional: renderer can ask for engine base URL
 ipcMain.handle("devpilot:getBaseUrl", () => baseUrl);
+ipcMain.on("devpilot:getBaseUrlSync", (event) => {
+  event.returnValue = baseUrl;
+});
