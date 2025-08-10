@@ -104,50 +104,6 @@ def repo_metadata(path: str = Query(..., description="relative file path")):
         "snapshot": STATE["snapshot"],
     }
 
-# ---------- v0.3: APPLY CHANGES SAFELY ----------
-@app.post("/apply")
-def apply_changes(payload: Dict[str, Any] = Body(...)):
-    """
-    payload = { "files": [ { "path": "...", "code": "..." }, ... ] }
-    Writes files relative to repo root, creates folders as needed.
-    Backs up existing file to .devpilot_backups/<relpath>.bak (single copy).
-    """
-    _ensure_repo()
-    files = payload.get("files")
-    if not isinstance(files, list):
-        raise HTTPException(400, "files array required")
-
-    repo = Path(STATE["repo_root"])
-    backup_root = repo / ".devpilot_backups"
-    backup_root.mkdir(exist_ok=True)
-
-    written: List[str] = []
-    for f in files:
-        rel = f.get("path")
-        code = f.get("code")
-        if not rel or code is None:
-            raise HTTPException(400, "each file needs {path, code}")
-        # prevent path traversal
-        rel_path = Path(rel)
-        if rel_path.is_absolute() or ".." in rel_path.parts:
-            raise HTTPException(400, f"invalid path: {rel}")
-
-        abs_path = repo / rel_path
-        abs_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # backup once if exists
-        if abs_path.exists():
-            backup_path = backup_root / (rel_path.as_posix() + ".bak")
-            backup_path.parent.mkdir(parents=True, exist_ok=True)
-            if not backup_path.exists():
-                shutil.copyfile(abs_path, backup_path)
-
-        abs_path.write_text(code, encoding="utf-8")
-        written.append(rel_path.as_posix())
-
-    # refresh snapshot for UI
-    STATE["snapshot"] = build_snapshot(repo)
-    return {"ok": True, "written": written}
 
 # ---------- v0.3: BASIC GIT ACTIONS ----------
 @app.post("/git/create-branch")
@@ -177,3 +133,122 @@ def git_push(payload: Dict[str, str] = Body(default={})):
     g = GitTaskManager(STATE["repo_root"])
     g.push(remote, branch)
     return {"ok": True, "branch": g.current_branch()}
+# ---------- v0.4: APPLY with dry-run ----------
+@app.post("/apply")
+def apply_changes(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = { "files": [{ "path": "...", "code": "..." }], "dry_run": bool }
+    """
+    _ensure_repo()
+    files = payload.get("files")
+    dry = bool(payload.get("dry_run", False))
+    if not isinstance(files, list):
+        raise HTTPException(400, "files array required")
+
+    repo = Path(STATE["repo_root"])
+    backup_root = repo / ".devpilot_backups"
+    backup_root.mkdir(exist_ok=True)
+
+    written: List[str] = []
+    for f in files:
+        rel = f.get("path")
+        code = f.get("code")
+        if not rel or code is None:
+            raise HTTPException(400, "each file needs {path, code}")
+
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise HTTPException(400, f"invalid path: {rel}")
+
+        abs_path = repo / rel_path
+        if dry:
+            # just preview; no write
+            written.append(rel_path.as_posix())
+            continue
+
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if abs_path.exists():
+            backup_path = backup_root / (rel_path.as_posix() + ".bak")
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            if not backup_path.exists():
+                shutil.copyfile(abs_path, backup_path)
+
+        abs_path.write_text(code, encoding="utf-8")
+        written.append(rel_path.as_posix())
+
+    if not dry:
+        STATE["snapshot"] = build_snapshot(repo)
+
+    return {"ok": True, "written": written, "dry_run": dry}
+
+# ---------- v0.4: REVERT from backups ----------
+@app.post("/revert")
+def revert_files(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = { "paths": ["rel/path.tsx", ...] }
+    Restores from .devpilot_backups/<path>.bak if present.
+    """
+    _ensure_repo()
+    repo = Path(STATE["repo_root"])
+    backup_root = repo / ".devpilot_backups"
+    paths = payload.get("paths") or []
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(400, "paths array required")
+
+    restored: List[str] = []
+    for rel in paths:
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise HTTPException(400, f"invalid path: {rel}")
+        src = backup_root / (rel_path.as_posix() + ".bak")
+        dst = repo / rel_path
+        if not src.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        restored.append(rel_path.as_posix())
+
+    STATE["snapshot"] = build_snapshot(repo)
+    return {"ok": True, "restored": restored}
+
+# ---------- v0.4: CREATE PR (GitHub) ----------
+@app.post("/git/create-pr")
+def git_create_pr(payload: Dict[str, str] = Body(...)):
+    """
+    Requires env GITHUB_TOKEN.
+    payload = { "title": "...", "body": "...", "remote": "origin", "base": "main" }
+    If repo slug not provided, inferred from git remote.
+    """
+    _ensure_repo()
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise HTTPException(400, "GITHUB_TOKEN not set in environment")
+
+    title = payload.get("title") or "DevPilot PR"
+    body = payload.get("body") or ""
+    remote = payload.get("remote") or "origin"
+    base = payload.get("base")  # optional; default branch if missing
+
+    g = GitTaskManager(STATE["repo_root"])
+    head = g.current_branch()
+    if not head:
+        raise HTTPException(400, "Could not determine current branch")
+
+    slug = payload.get("slug") or g.repo_slug_from_remote(remote)
+    if not slug:
+        raise HTTPException(400, "Could not infer repo slug from git remote; pass payload.slug (owner/repo)")
+
+    if not base:
+        base = g.default_branch()
+
+    url = f"https://api.github.com/repos/{slug}/pulls"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        json={"title": title, "body": body, "head": head, "base": base}
+    )
+    if resp.status_code >= 300:
+        raise HTTPException(resp.status_code, f"GitHub PR create failed: {resp.text}")
+
+    return {"ok": True, "pr": resp.json()}
