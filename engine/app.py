@@ -14,6 +14,8 @@ import difflib
 from datetime import datetime
 import subprocess
 from openai import OpenAI
+import requests
+
 # Load the .env file
 load_dotenv()
 app = FastAPI(title="DevPilot Engine", version="0.3.0")
@@ -31,14 +33,76 @@ def log(msg: str):
     if len(LOGS) > 500:
         del LOGS[:len(LOGS)-500]
 
-STATE: Dict[str, Any] = {
+STATE = {
     "repo_root": None,
     "snapshot": {},
-    "settings": {  # new
-        "slug_override": None,      # "owner/repo"
-        "default_base": None        # e.g. "main"
+    "settings": {
+        "slug_override": None,
+        "default_base": None,
+        "ai": {
+            "mode": "dev",             # dev | pro
+            "provider": "openai",      # openai | webllm | http
+            "openai_key": None,
+            "http_endpoint": "http://127.0.0.1:8080/v1/chat/completions",  # JSON API compatible
+            "model": "gpt-4o-mini"
+        },
+        "telemetry": {                 # local-only counters
+            "enabled": False,
+            "runs": 0,
+            "applied_files": 0
+        },
+        "first_run_done": False
     }
 }
+def _mux_complete(prompt: str, files_hint: list[dict] | None = None) -> dict:
+    """
+    Returns {"files":[{"path":"...","code":"..."}], "raw": <raw response>}
+    Uses provider from STATE["settings"]["ai"].
+    The prompt must instruct STRICT JSON {"files":[...]}.
+    """
+    ai = STATE["settings"]["ai"]
+    provider = ai.get("provider")
+    model = ai.get("model") or "gpt-4o-mini"
+
+    if provider == "openai":
+        from openai import OpenAI
+        key = ai.get("openai_key")
+        if not key:
+            raise HTTPException(400, "OpenAI key not set")
+        client = OpenAI(api_key=key)
+        out = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2,
+            max_tokens=4096
+        )
+        text = out.choices[0].message.content or ""
+        raw = out.model_dump()
+    elif provider == "http":
+        ep = ai.get("http_endpoint")
+        if not ep:
+            raise HTTPException(400, "HTTP endpoint not configured")
+        payload = {"model": model, "messages":[{"role":"user","content":prompt}], "temperature":0.2, "max_tokens":4096}
+        r = requests.post(ep, json=payload, timeout=120)
+        if r.status_code >= 300:
+            raise HTTPException(r.status_code, f"HTTP provider failed: {r.text[:400]}")
+        data = r.json()
+        text = data.get("choices",[{}])[0].get("message",{}).get("content","")
+        raw = data
+    else:
+        # webllm (dev): the renderer handles this client-side; engine just returns unsupported
+        raise HTTPException(400, "Provider 'webllm' runs in renderer; use UI Auto-Patch (Dev Mode)")
+
+    # extract JSON block
+    try:
+        # naive extraction: find first '{' and last '}' for a JSON object
+        import json, re
+        match = re.search(r"\{[\s\S]*\}", text)
+        obj = json.loads(match.group(0)) if match else json.loads(text)
+        if not isinstance(obj.get("files"), list): raise ValueError("no files[]")
+        return {"files": obj["files"], "raw": raw}
+    except Exception as e:
+        raise HTTPException(500, f"Model did not return valid JSON files[]: {e}")
 def _read_file_text(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
 
@@ -401,18 +465,18 @@ def git_revert_pr(payload: Dict[str, Any] = Body(...)):
 
     return {"ok": True, "pr": resp.json()}
 
-@app.get("/settings")
-def get_settings():
-    return {"ok": True, "settings": STATE["settings"]}
-
 @app.post("/settings")
 def set_settings(payload: Dict[str, Any] = Body(...)):
     s = STATE["settings"]
     if "slug_override" in payload: s["slug_override"] = payload.get("slug_override")
     if "default_base"  in payload: s["default_base"]  = payload.get("default_base")
+    if "first_run_done" in payload: s["first_run_done"] = bool(payload.get("first_run_done"))
+    if "telemetry" in payload and isinstance(payload["telemetry"], dict):
+        tel = s["telemetry"]
+        tel["enabled"] = bool(payload["telemetry"].get("enabled", tel["enabled"]))
     if "ai" in payload and isinstance(payload["ai"], dict):
         s_ai = s["ai"]
-        for k in ["mode", "provider", "openai_key"]:
+        for k in ["mode", "provider", "openai_key", "http_endpoint", "model"]:
             if k in payload["ai"]:
                 s_ai[k] = payload["ai"][k]
     return {"ok": True, "settings": s}
@@ -706,3 +770,39 @@ def session_import(payload: Dict[str, Any] = Body(...)):
     if "snapshot" in sess and isinstance(sess["snapshot"], dict):
         STATE["snapshot"] = sess["snapshot"]
     return {"ok": True, "settings": STATE["settings"], "snapshot_len": len(STATE["snapshot"])}
+
+@app.post("/autopatch")
+def autopatch(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = {
+      "prompt": "...",                 # full prompt built by UI
+      "dry_run": True,                 # preview only
+      "force": False                   # override conflicts
+    }
+    """
+    _ensure_repo()
+    s = STATE["settings"]
+    tel = s["telemetry"]
+    dry = bool(payload.get("dry_run", True))
+    force = bool(payload.get("force", False))
+    prompt = payload.get("prompt")
+    if not prompt: raise HTTPException(400, "prompt required")
+
+    # call model
+    result = _mux_complete(prompt)
+    files = result["files"]
+
+    # plan
+    plan_res = apply_plan({"files":[{"path":f["path"],"code":f["code"],"expected_current":_read_file_text(Path(STATE["repo_root"])/f["path"])} for f in files]})  # type: ignore
+    plan = plan_res["plan"]
+
+    if dry:
+        if tel["enabled"]: tel["runs"] += 1
+        return {"ok": True, "plan": plan, "files": files, "applied": False}
+
+    # apply strict
+    strict_res = apply_strict({"files":[{"path":f["path"],"code":f["code"],"expected_current":_read_file_text(Path(STATE["repo_root"])/f["path"]), "force": force} for f in files], "force": force})
+    if tel["enabled"]:
+        tel["runs"] += 1
+        tel["applied_files"] += len(strict_res.get("written", []))
+    return {"ok": True, "plan": plan, "files": files, "applied": True, "strict": strict_res}
