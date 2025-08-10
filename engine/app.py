@@ -9,7 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, shutil
 
 from utils.git_task_manager import GitTaskManager
+from dotenv import load_dotenv
 
+# Load the .env file
+load_dotenv()
 app = FastAPI(title="DevPilot Engine", version="0.3.0")
 
 # allow Vite/Electron dev to call the API
@@ -19,11 +22,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+LOGS = []  # simple ring buffer
+def log(msg: str):
+    LOGS.append(msg)
+    if len(LOGS) > 500:
+        del LOGS[:len(LOGS)-500]
 
 STATE: Dict[str, Any] = {
     "repo_root": None,
     "snapshot": {},
+    "settings": {  # new
+        "slug_override": None,      # "owner/repo"
+        "default_base": None        # e.g. "main"
+    }
 }
 
 @app.get("/health")
@@ -381,3 +392,53 @@ def git_revert_pr(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(resp.status_code, f"GitHub PR create failed: {resp.text}")
 
     return {"ok": True, "pr": resp.json()}
+
+@app.get("/settings")
+def get_settings():
+    return {"ok": True, "settings": STATE["settings"]}
+
+@app.post("/settings")
+def set_settings(payload: Dict[str, Any] = Body(...)):
+    s = STATE["settings"]
+    s["slug_override"] = payload.get("slug_override")
+    s["default_base"]  = payload.get("default_base")
+    return {"ok": True, "settings": s}
+
+@app.get("/logs")
+def get_logs():
+    return {"ok": True, "lines": LOGS[-400:]}
+
+# helper for constructing Git manager with logging
+def _git() -> GitTaskManager:
+    _ensure_repo()
+    return GitTaskManager(STATE["repo_root"], logger=log)
+
+@app.get("/git/branches")
+def git_branches():
+    g = _git()
+    return {"ok": True, "branches": g.branches(), "current": g.current_branch()}
+
+@app.get("/git/prs")
+def git_list_prs(remote: str = "origin", state: str = "open"):
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise HTTPException(400, "GITHUB_TOKEN not set")
+    g = _git()
+    slug = STATE["settings"].get("slug_override") or g.repo_slug_from_remote(remote)
+    if not slug:
+        raise HTTPException(400, "Could not infer repo slug; set settings.slug_override")
+
+    url = f"https://api.github.com/repos/{slug}/pulls?state={state}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    if resp.status_code >= 300:
+        raise HTTPException(resp.status_code, f"List PRs failed: {resp.text}")
+    return {"ok": True, "prs": resp.json()}
+
+@app.get("/git/remote")
+def git_remote(remote: str = "origin"):
+    _ensure_repo()
+    g = _git()
+    url = g.remote_url(remote) or ""
+    slug = STATE["settings"].get("slug_override") or g.repo_slug_from_remote(remote)
+    host = "github.com" if "github.com" in (url or "") else None
+    return {"ok": True, "remote": remote, "url": url, "slug": slug, "host": host}
