@@ -1,0 +1,50 @@
+{
+  "name": "devpilot-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/main/main.js",
+  "type": "module",
+  "scripts": {
+    "dev:renderer": "vite --config vite.renderer.config.ts",
+    "dev:main": "tsc -w -p tsconfig.main.json --preserveWatchOutput",
+    "dev:preload": "tsc -w -p tsconfig.preload.json --preserveWatchOutput",
+    "dev:electron": "wait-on tcp:5173 dist/main/main.js && ELECTRON_DEV=1 electron .",
+    "dev": "run-p dev:renderer dev:main dev:preload dev:electron",
+    "build:renderer": "vite build --config vite.renderer.config.ts",
+    "build:main": "tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json",
+    "build": "npm run build:renderer && npm run build:main",
+    "start": "electron .",
+    "package": "electron-builder"
+  },
+  "dependencies": {
+    "electron": "^31.2.0",
+    "fast-glob": "^3.3.3",
+    "framer-motion": "^11.18.2",
+    "keytar": "^7.9.0",
+    "lucide-react": "^0.452.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^7.8.0",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.1",
+    "@types/node": "^20.11.30",
+    "@types/react": "^18.2.22",
+    "@types/react-dom": "^18.2.7",
+    "@types/sqlite3": "^3.1.11",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^8.2.2",
+    "cross-env": "^10.0.0",
+    "electron-builder": "^24.13.3",
+    "monaco-editor": "^0.44.0",
+    "npm-run-all": "^4.1.5",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.3",
+    "wait-on": "^8.0.4"
+  }
+}

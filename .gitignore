@@ -40,3 +40,16 @@ desktop/.env.local
 # Build cache
 **/build/
 **/dist/
+# Node (desktop)
+devpilot_starter/apps/desktop/node_modules/
+devpilot_starter/apps/desktop/dist/
+devpilot_starter/apps/desktop/out/
+devpilot_starter/apps/desktop/.vite/
+devpilot_starter/apps/desktop/*.log
+devpilot_starter/apps/desktop/*.tgz
+
+# Electron artifacts
+devpilot_starter/apps/desktop/release/
+devpilot_starter/apps/desktop/*.dmg
+devpilot_starter/apps/desktop/*.exe
+devpilot_starter/apps/desktop/*.AppImage

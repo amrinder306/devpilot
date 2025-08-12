@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "outDir": "dist/main",
+    "rootDir": "src/main",
+    "moduleResolution": "Node",
+    "esModuleInterop": true,
+    "types": ["node"]
+  },
+  "include": ["src/main/preload.ts"]
+}
