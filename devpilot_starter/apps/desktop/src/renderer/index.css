@@ -1,6 +1,4 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 /* Hook Tailwind to our CSS variable palette via utility aliases from the component's <StyleVariables/> */
 :root, :root[data-theme="light"] {

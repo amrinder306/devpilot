@@ -53,3 +53,4 @@ devpilot_starter/apps/desktop/release/
 devpilot_starter/apps/desktop/*.dmg
 devpilot_starter/apps/desktop/*.exe
 devpilot_starter/apps/desktop/*.AppImage
+devpilot_starter/apps/desktop/yarn.lock

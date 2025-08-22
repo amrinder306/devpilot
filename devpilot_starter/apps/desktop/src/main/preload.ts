@@ -50,6 +50,10 @@ const api = {
     // return unsubscribe
     return () => ipcRenderer.removeListener(channel, handler);
   },
+  resetDeviceToken: () => ipcRenderer.invoke('auth:resetToken'),
+  readFile: (repoRoot: string, relPath: string) =>
+    ipcRenderer.invoke('fs:readFile', { repoRoot, relPath }),
+
 };
 
 declare global {

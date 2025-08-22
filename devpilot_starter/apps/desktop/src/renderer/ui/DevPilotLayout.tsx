@@ -16,12 +16,17 @@ import {
   Sun,
   Laptop,
 } from "lucide-react";
-
+import Editor, { loader } from "@monaco-editor/react";
+import { devpilot } from "../lib/devpilot";
+import { diffLines } from "diff";
+import * as monaco from 'monaco-editor';
+loader.config({ monaco });
+// at top with other imports (if not already)
 /**
  * Final DevPilot layout with theme switching and Tailwind utility classes.
  * (Matches the design we agreed on.)
  */
-
+loader.init().then(m=> console.log("here is the monaco insatance", m));
 type Theme = "light" | "dark" | "system";
 const THEME_KEY = "devpilot.theme";
 
@@ -139,23 +144,22 @@ function TopNav() {
   );
 }
 
-function CodeEditorMock() {
+function CodeEditorMock(){
+  const [code, setCode] = React.useState(`// Monaco is live
+function hello(){
+  return 'world'
+}`)
   return (
-    <div className="font-mono text-[13px] leading-6 p-4 select-text whitespace-pre overflow-auto">
-{`import React from 'react';
-
-function App() {
-  return (
-    <div className="App">
-      <h1>Welcome to DevPilot</h1>
-      <p>AI-powered development assistant</p>
+    <div className="h-full">
+      <Editor
+        height="100%"
+        defaultLanguage="typescript"
+        value={code}
+        onChange={(v)=>setCode(v||'')}
+        options={{ fontSize: 13, minimap: { enabled: false }, theme: (document.documentElement.getAttribute('data-theme')==='light'?'vs':'vs-dark') as any }}
+      />
     </div>
-  );
-}
-
-export default App;`}
-    </div>
-  );
+  )
 }
 
 function DiffPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -188,7 +192,65 @@ function DiffPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   );
 }
 
+// put this near your other imports if not already present
+
+// Optional: a tiny helper to safely pull text out of different LLM adapters
+const getLLMText = (r: any) =>
+  r?.text ??
+  r?.choices?.[0]?.message?.content ??
+  r?.message ??
+  (typeof r === "string" ? r : JSON.stringify(r))
+
+type ChatMsg = { id: string; role: "user" | "ai"; text: string; meta?: { model?: string } }
+
 function AIPanel({ open }: { open: boolean }) {
+  const [chat, setChat] = React.useState<ChatMsg[]>([])
+  const [input, setInput] = React.useState("Summarize this repository.")
+  const [busy, setBusy] = React.useState(false)
+  const [err, setErr] = React.useState<string | null>(null)
+  const listRef = React.useRef<HTMLDivElement>(null)
+
+  // auto-scroll to bottom on new messages
+  React.useEffect(() => {
+    const el = listRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [chat, busy])
+
+  const send = async () => {
+    const q = input.trim()
+    if (!q || busy) return
+    setErr(null)
+    setBusy(true)
+
+    const uid = crypto.randomUUID()
+    setChat((c) => [...c, { id: uid, role: "user", text: q }])
+    setInput("")
+
+    try {
+      // minimal request: use 'plan' task; you can switch based on UI later
+      const res = await window.devpilot.llmRun({
+        task: "plan",
+        slices: [], // add repo slices later for context
+        promptMeta: { instruction: q },
+      })
+      const text = getLLMText(res) || "(no text)"
+      const model = res?.model_id || res?.model || res?.endpoint || undefined
+      setChat((c) => [...c, { id: crypto.randomUUID(), role: "ai", text, meta: { model } }])
+    } catch (e: any) {
+      setErr(String(e?.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Enter to send, Shift+Enter newline
+  const onKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault()
+      send()
+    }
+  }
+
   return (
     <AnimatePresence>
       {open && (
@@ -203,30 +265,85 @@ function AIPanel({ open }: { open: boolean }) {
             <div className="text-xs font-semibold flex items-center gap-2">
               <Bot className="h-4 w-4" /> AI Assistant
             </div>
+            {/* green dot = panel ready (you could toggle on endpoint health) */}
             <div className="w-2 h-2 rounded-full bg-green-500/80" />
           </div>
-          <div className="flex-1 overflow-auto p-3 space-y-2">
-            <div className="rounded-lg bg-elev p-2 text-xs">
-              I notice you're working on a React component. Want suggestions?
-            </div>
-            <div className="rounded-lg bg-accent/10 border border-accent text-xs p-2 ml-8">
-              Yes, please review the TypeScript types.
-            </div>
-            <div className="rounded-lg bg-elev p-2 text-xs">
-              Great! Consider adding an ErrorBoundary and prop validation.
-            </div>
+
+          {/* transcript */}
+          <div ref={listRef} className="flex-1 overflow-auto p-3 space-y-2">
+            {chat.map((m) => (
+              <div
+                key={m.id}
+                className={
+                  "rounded-lg p-2 text-xs " +
+                  (m.role === "ai" ? "bg-elev" : "bg-accent/10 border border-accent ml-8")
+                }
+              >
+                <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+                {m.meta?.model && (
+                  <div className="mt-1 opacity-60 text-[10px]">model: {m.meta.model}</div>
+                )}
+              </div>
+            ))}
+            {!chat.length && (
+              <div className="rounded-lg bg-elev p-2 text-xs opacity-70">
+                Ask a question about your codebase. Tip: “Plan test coverage for the {`<repo>`} module.”
+              </div>
+            )}
           </div>
+
+          {/* input */}
           <div className="h-14 border-t bg-elev p-2 flex items-center gap-2">
             <input
               className="flex-1 text-sm px-3 py-2 rounded-md bg-subtle border outline-none focus:ring-2 focus:ring-accent/40"
               placeholder="Ask anything…"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={onKeyDown}
+              disabled={busy}
             />
-            <button className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Send</button>
+            <button
+              onClick={send}
+              disabled={busy}
+              className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40 disabled:opacity-60"
+            >
+              {busy ? "Sending…" : "Send"}
+            </button>
           </div>
+
+          {/* error bar */}
+          {err && (
+            <div className="border-t bg-elev px-3 py-2 text-[11px] text-red-400">⚠ {err}</div>
+          )}
         </motion.aside>
       )}
     </AnimatePresence>
-  );
+  )
+}
+
+function AIPanelInput({ onAdd }: { onAdd: (u:{role:'user',text:string}, a:{role:'ai',text:string}) => void }){
+  const [input, setInput] = React.useState('Summarize this repository.')
+  const [busy, setBusy] = React.useState(false)
+  const [err, setErr] = React.useState<string | null>(null)
+
+  const send = async () => {
+    try {
+      setBusy(true); setErr(null)
+      const r = await devpilot.llmRun({ task:'plan', slices: [], promptMeta: { instruction: input } })
+      onAdd({role:'user', text: input}, {role:'ai', text: r?.text || '(no text)'} )
+    } catch (e:any) {
+      setErr(String(e?.message || e))
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="w-full flex items-center gap-2">
+      <input className="flex-1 text-sm px-3 py-2 rounded-md bg-subtle border outline-none focus:ring-2 focus:ring-accent/40"
+             placeholder="Ask anything…" value={input} onChange={e=>setInput(e.target.value)} />
+      <button onClick={send} disabled={busy} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">{busy?'Sending…':'Send'}</button>
+      {err && <div className="text-xs text-red-400 ml-2">⚠ {err}</div>}
+    </div>
+  )
 }
 
 function QuickFAB() {
@@ -248,11 +365,134 @@ function QuickFAB() {
 // Page placeholders
 function PageDashboard(){ return <div className="p-4">Dashboard</div> }
 function PageRepos(){ return <div className="p-4">Repos</div> }
-function PageWorkbench(){ return <div className="p-4">Workbench</div> }
-function PagePatch(){ return <div className="p-4">Patch Review</div> }
+function PageWorkbench(){
+  const [repoRoot, setRepoRoot] = React.useState('')
+  const [jobId, setJobId] = React.useState<string | null>(null)
+  const [logs, setLogs] = React.useState<string[]>([])
+  const [status, setStatus] = React.useState<'idle'|'running'|'passed'|'failed'>('idle')
+
+  const browse = async () => {
+    const p = await devpilot.pickFolder()
+    if (p) setRepoRoot(p)
+  }
+  React.useEffect(()=>{
+    if (!jobId) return
+    const onStart = () => setStatus('running')
+    const onLog = (d:any) => setLogs(prev => [...prev, d.line])
+    const onEnd = (d:any) => setStatus(d.ok ? 'passed' : 'failed')
+    const off1 = window.devpilot.onValidationEvent(jobId, 'start', onStart)
+    const off2 = window.devpilot.onValidationEvent(jobId, 'log', onLog)
+    const off3 = window.devpilot.onValidationEvent(jobId, 'end', onEnd)
+    return () => { off1?.(); off2?.(); off3?.(); }
+  }, [jobId])
+
+  const run = async () => {
+    setLogs([]); setStatus('running')
+    const r = await window.devpilot.validationStart(repoRoot)
+    setJobId(r.jobId)
+  }
+  const stop = async () => { if (jobId) await window.devpilot.validationStop(jobId) }
+
+  return (
+    <div className="p-4 space-y-3">
+      <h2 className="text-lg font-semibold">Workbench</h2>
+      <div className="rounded-xl border bg-subtle p-4 space-y-2">
+        <div className="flex items-center gap-2">
+          <input className="flex-1 px-3 py-2 rounded-md bg-elev border" placeholder="/path/to/repo" value={repoRoot} onChange={e=>setRepoRoot(e.target.value)} />
+          <button onClick={browse} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Browse…</button>
+          <button onClick={run} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Run</button>
+          <button onClick={stop} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40" disabled={!jobId}>Stop</button>
+          <div className="text-xs opacity-70">Status: {status}</div>
+        </div>
+        <pre className="mt-2 h-64 rounded-md bg-elev border p-2 font-mono text-xs overflow-auto">{logs.join('\\n')}</pre>
+      </div>
+    </div>
+  )
+}
+
+
+function PagePatch(){
+  const [repoRoot, setRepoRoot] = React.useState('')
+  const [path, setPath] = React.useState('src/example.ts')
+  const [original, setOriginal] = React.useState('')
+  const [modified, setModified] = React.useState('')
+  const [selected, setSelected] = React.useState<Record<number, boolean>>({})
+
+  const load = async () => {
+    const r = await window.devpilot.readFile(repoRoot, path)
+    setOriginal(r?.content || '')
+  }
+
+  const hunks = React.useMemo(() => diffLines(original, modified), [original, modified])
+
+  const applySelected = async () => {
+    let out = ''
+    hunks.forEach((h, i) => {
+      if (h.added) out += (selected[i] ? h.value : '')
+      else if (h.removed) out += (selected[i] ? '' : h.value)
+      else out += h.value
+    })
+    await window.devpilot.applyWithBackup(repoRoot, path, out)
+    alert('Applied with backup.')
+  }
+
+  return (
+    <div className="p-4 space-y-3">
+      <h2 className="text-lg font-semibold">Patch Review</h2>
+      <div className="flex gap-2">
+        <input className="flex-1 px-3 py-2 rounded-md bg-elev border" placeholder="/repo/root" value={repoRoot} onChange={e=>setRepoRoot(e.target.value)} />
+        <input className="flex-1 px-3 py-2 rounded-md bg-elev border" placeholder="relative/path.ts" value={path} onChange={e=>setPath(e.target.value)} />
+        <button onClick={load} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Load Original</button>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <textarea className="rounded-md bg-elev border p-2 font-mono text-xs h-72" placeholder="Original" value={original} onChange={e=>setOriginal(e.target.value)} />
+        <textarea className="rounded-md bg-elev border p-2 font-mono text-xs h-72" placeholder="Modified" value={modified} onChange={e=>setModified(e.target.value)} />
+      </div>
+      <div className="mt-2">
+        <div className="text-xs opacity-70 mb-1">Hunks</div>
+        <ul className="space-y-1">
+          {hunks.map((h,i)=>(
+            <li key={i}>
+              <label className="text-xs flex items-center gap-2">
+                <input type="checkbox" checked={!!selected[i]} onChange={()=>setSelected(s=>({...s, [i]: !s[i]}))} />
+                {h.added?'ADD':h.removed?'DEL':'EQ'} — {String(h.count || 0)} lines
+              </label>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={applySelected} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Apply Selected</button>
+        <button onClick={()=>window.devpilot.rollbackFile(repoRoot, path)} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Rollback</button>
+      </div>
+    </div>
+  )
+}
+
 function PageLLM(){ return <div className="p-4">LLM Test</div> }
 function PageReports(){ return <div className="p-4">Reports</div> }
-function PageSettings(){ return <div className="p-4">Settings</div> }
+function PageSettings(){
+  const [core, setCore] = React.useState('')
+  React.useEffect(()=>{ devpilot.getConfig().then(c => setCore(c?.coreApi || '')) },[])
+  const save = async () => { await devpilot.saveConfig({ coreApi: core }); alert('Saved') }
+  const reset = async () => { await window.devpilot.resetDeviceToken(); alert('Device token removed. Restart to see First-Run.'); }
+
+  return (
+    <div className="p-4 space-y-3">
+      <h2 className="text-lg font-semibold">Settings</h2>
+      <div className="rounded-xl border bg-subtle p-4 space-y-2">
+        <div className="text-xs opacity-70">Core API</div>
+        <div className="flex gap-2">
+          <input className="flex-1 px-3 py-2 rounded-md bg-elev border" placeholder="https://core.example.com" value={core} onChange={e=>setCore(e.target.value)} />
+          <button onClick={save} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Save</button>
+        </div>
+        <div className="mt-4 text-xs opacity-70">Developer</div>
+        <button onClick={reset} className="px-3 py-2 text-xs rounded-md border hover:bg-accent/40">Reset Device Token (Dev)</button>
+      </div>
+    </div>
+  )
+}
+
 
 export default function DevPilotLayout(){
   const [page, setPage] = useState<NavKey>("dashboard");
